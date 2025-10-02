@@ -7,8 +7,6 @@ import {
   Download,
   Users,
   AlertCircle,
-  CheckCircle,
-  Loader,
 } from "lucide-react";
 import {
   LineChart,
@@ -19,15 +17,15 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
-import io from "socket.io-client";
+import { io } from "socket.io-client";
 
-const CHUNK_SIZE = 256 * 1024; // chunks size
-const SERVER_URL = "http://localhost:3001";
+const CHUNK_SIZE = 256 * 1024;
+const SERVER_URL = "https://plink-revamp-backend.onrender.com";
 
 export default function P2PFileSharing() {
   const [roomName, setRoomName] = useState("");
-  const [isConnected, setIsConnected] = useState(false);
-  const [peerConnected, setPeerConnected] = useState(false);
+  const [isConnected, setIsConnected] = useState(false); // server-level joined
+  const [peerConnected, setPeerConnected] = useState(false); // WebRTC connected
   const [serverOnline, setServerOnline] = useState(false);
   const [messages, setMessages] = useState([]);
   const [messageInput, setMessageInput] = useState("");
@@ -47,11 +45,11 @@ export default function P2PFileSharing() {
   const startTimeRef = useRef(0);
   const fileMetadataRef = useRef(null);
 
-  // Check server status
+  // Periodically check server health
   const checkServerStatus = async () => {
     try {
-      const response = await fetch(`${SERVER_URL}/health`);
-      const data = await response.json();
+      const res = await fetch(`${SERVER_URL}/health`);
+      const data = await res.json();
       setServerOnline(data.status === "online");
       setError("");
     } catch (err) {
@@ -62,80 +60,163 @@ export default function P2PFileSharing() {
 
   useEffect(() => {
     checkServerStatus();
-    const interval = setInterval(checkServerStatus, 5000);
-    return () => clearInterval(interval);
+    const id = setInterval(checkServerStatus, 5000);
+    return () => clearInterval(id);
   }, []);
 
-  // Initialize Socket.io
-  const initializeSocket = () => {
-    socketRef.current = io(SERVER_URL);
-
-    socketRef.current.on("connect", () => {
-      console.log("Connected to signaling server");
+  // create single socket instance once
+  useEffect(() => {
+    socketRef.current = io(SERVER_URL, {
+      autoConnect: false,
+      transports: ["websocket", "polling"],
+      reconnectionAttempts: 5,
     });
 
-    socketRef.current.on("waiting-for-peer", () => {
+    const s = socketRef.current;
+
+    // attach handlers
+    s.on("connect", () => {
+      console.log("Connected to signaling server", s.id);
+      setError("");
+    });
+
+    s.on("connect_error", (err) => {
+      console.warn("Socket connect_error:", err?.message || err);
+      setError("Signaling server connection error");
+    });
+
+    s.on("waiting-for-peer", () => {
+      setIsConnected(true);
       setError("Waiting for peer to join...");
     });
 
-    socketRef.current.on("room-full", () => {
+    s.on("room-full", () => {
       setError("Room is full! Try a different room name.");
       setIsConnected(false);
+      s.disconnect();
     });
 
-    socketRef.current.on("peer-joined", ({ peerId }) => {
-      console.log("Peer joined:", peerId);
+    s.on("joined-room", ({ room, position }) => {
+      setIsConnected(true);
+      setError("");
+    });
+
+    s.on("peer-joined", ({ peerId }) => {
       peerIdRef.current = peerId;
+      // initiator is the one which joined first? We keep simple: if we are not the second position,
+      // create offer as initiator. Server sets peer-joined to both; caller createsOffer true for the peer who got 'peerId' set after both in room.
       createPeerConnection(true);
     });
 
-    socketRef.current.on("webrtc-offer", ({ offer, from }) => {
+    s.on("webrtc-offer", ({ offer, from }) => {
       peerIdRef.current = from;
       createPeerConnection(false);
-      peerConnectionRef.current
-        .setRemoteDescription(new RTCSessionDescription(offer))
-        .then(() => peerConnectionRef.current.createAnswer())
-        .then((answer) => peerConnectionRef.current.setLocalDescription(answer))
-        .then(() => {
-          socketRef.current.emit("webrtc-answer", {
-            answer: peerConnectionRef.current.localDescription,
-            to: from,
-          });
-        });
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current
+          .setRemoteDescription(new RTCSessionDescription(offer))
+          .then(() => peerConnectionRef.current.createAnswer())
+          .then((answer) =>
+            peerConnectionRef.current.setLocalDescription(answer),
+          )
+          .then(() => {
+            s.emit("webrtc-answer", {
+              answer: peerConnectionRef.current.localDescription,
+              to: from,
+            });
+          })
+          .catch((e) => console.error("answer error:", e));
+      }
     });
 
-    socketRef.current.on("webrtc-answer", ({ answer }) => {
-      peerConnectionRef.current.setRemoteDescription(
-        new RTCSessionDescription(answer),
-      );
+    s.on("webrtc-answer", ({ answer }) => {
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.setRemoteDescription(
+          new RTCSessionDescription(answer),
+        );
+      }
     });
 
-    socketRef.current.on("ice-candidate", ({ candidate }) => {
-      peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+    s.on("ice-candidate", ({ candidate }) => {
+      if (peerConnectionRef.current && candidate) {
+        peerConnectionRef.current.addIceCandidate(
+          new RTCIceCandidate(candidate),
+        );
+      }
     });
 
-    socketRef.current.on("peer-status", ({ status }) => {
+    s.on("peer-status", ({ status }) => {
       setPeerStatus(status);
     });
 
-    socketRef.current.on("peer-disconnected", () => {
+    s.on("peer-disconnected", () => {
       setPeerConnected(false);
       setPeerStatus("offline");
-      setMessages((prev) => [
-        ...prev,
-        { type: "system", text: "Peer disconnected" },
-      ]);
+      setMessages((p) => [...p, { type: "system", text: "Peer disconnected" }]);
+      // close existing peer connection
+      if (peerConnectionRef.current) {
+        try {
+          peerConnectionRef.current.close();
+        } catch (e) {}
+        peerConnectionRef.current = null;
+      }
     });
-  };
 
-  // Create WebRTC connection
+    s.on("peer-left", () => {
+      setPeerConnected(false);
+      setPeerStatus("offline");
+      setMessages((p) => [...p, { type: "system", text: "Peer left" }]);
+    });
+
+    // cleanup on unmount
+    const handleUnload = () => {
+      if (socketRef.current && socketRef.current.connected) {
+        socketRef.current.emit("leave-room");
+        socketRef.current.disconnect();
+      }
+      if (peerConnectionRef.current) {
+        try {
+          peerConnectionRef.current.close();
+        } catch (e) {}
+        peerConnectionRef.current = null;
+      }
+    };
+    window.addEventListener("beforeunload", handleUnload);
+
+    return () => {
+      window.removeEventListener("beforeunload", handleUnload);
+      if (socketRef.current) {
+        socketRef.current.off();
+        socketRef.current.disconnect();
+      }
+      if (peerConnectionRef.current) {
+        try {
+          peerConnectionRef.current.close();
+        } catch (e) {}
+        peerConnectionRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Peer connection helper
   const createPeerConnection = (isInitiator) => {
+    // if already exists, close and recreate
+    if (peerConnectionRef.current) {
+      try {
+        peerConnectionRef.current.close();
+      } catch (e) {}
+      peerConnectionRef.current = null;
+      dataChannelRef.current = null;
+      fileChannelRef.current = null;
+      setPeerConnected(false);
+    }
+
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
     });
 
     pc.onicecandidate = (event) => {
-      if (event.candidate) {
+      if (event.candidate && socketRef.current && peerIdRef.current) {
         socketRef.current.emit("ice-candidate", {
           candidate: event.candidate,
           to: peerIdRef.current,
@@ -148,8 +229,8 @@ export default function P2PFileSharing() {
       if (pc.connectionState === "connected") {
         setPeerConnected(true);
         setError("");
-        setMessages((prev) => [
-          ...prev,
+        setMessages((p) => [
+          ...p,
           { type: "system", text: "Connected to peer!" },
         ]);
       } else if (
@@ -160,13 +241,24 @@ export default function P2PFileSharing() {
       }
     };
 
-    // Chat channel
     if (isInitiator) {
       const chatChannel = pc.createDataChannel("chat");
       setupChatChannel(chatChannel);
 
       const fileChannel = pc.createDataChannel("file", { ordered: true });
       setupFileChannel(fileChannel);
+
+      pc.createOffer()
+        .then((offer) => pc.setLocalDescription(offer))
+        .then(() => {
+          if (socketRef.current && peerIdRef.current) {
+            socketRef.current.emit("webrtc-offer", {
+              offer: pc.localDescription,
+              to: peerIdRef.current,
+            });
+          }
+        })
+        .catch((e) => console.error("offer error:", e));
     } else {
       pc.ondatachannel = (event) => {
         if (event.channel.label === "chat") {
@@ -178,39 +270,29 @@ export default function P2PFileSharing() {
     }
 
     peerConnectionRef.current = pc;
-
-    if (isInitiator) {
-      pc.createOffer()
-        .then((offer) => pc.setLocalDescription(offer))
-        .then(() => {
-          socketRef.current.emit("webrtc-offer", {
-            offer: pc.localDescription,
-            to: peerIdRef.current,
-          });
-        });
-    }
   };
 
   const setupChatChannel = (channel) => {
     dataChannelRef.current = channel;
-
     channel.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === "message") {
-        setMessages((prev) => [...prev, { type: "received", text: data.text }]);
-      } else if (data.type === "typing") {
-        setPeerStatus("typing");
-        setTimeout(() => setPeerStatus("idle"), 2000);
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === "message") {
+          setMessages((p) => [...p, { type: "received", text: data.text }]);
+        } else if (data.type === "typing") {
+          setPeerStatus("typing");
+          setTimeout(() => setPeerStatus("idle"), 2000);
+        }
+      } catch (e) {
+        console.warn("chat onmessage parse failed", e);
       }
     };
-
     channel.onopen = () => console.log("Chat channel opened");
     channel.onclose = () => console.log("Chat channel closed");
   };
 
   const setupFileChannel = (channel) => {
     fileChannelRef.current = channel;
-
     channel.onmessage = (event) => {
       if (typeof event.data === "string") {
         const metadata = JSON.parse(event.data);
@@ -218,7 +300,6 @@ export default function P2PFileSharing() {
         fileBufferRef.current = [];
         receivedSizeRef.current = 0;
         startTimeRef.current = Date.now();
-
         setTransferStats({
           fileName: metadata.name,
           totalSize: metadata.size,
@@ -232,12 +313,13 @@ export default function P2PFileSharing() {
       } else {
         fileBufferRef.current.push(event.data);
         receivedSizeRef.current += event.data.byteLength;
-
-        const elapsed = (Date.now() - startTimeRef.current) / 1000;
+        const elapsed = Math.max(
+          (Date.now() - startTimeRef.current) / 1000,
+          0.001,
+        );
         const speed = receivedSizeRef.current / elapsed;
         const progress =
           (receivedSizeRef.current / fileMetadataRef.current.size) * 100;
-
         setTransferStats((prev) => ({
           ...prev,
           receivedSize: receivedSizeRef.current,
@@ -245,7 +327,6 @@ export default function P2PFileSharing() {
           speed,
           chunks: fileBufferRef.current.length,
         }));
-
         setSpeedData((prev) => [
           ...prev.slice(-20),
           {
@@ -253,57 +334,52 @@ export default function P2PFileSharing() {
             speed: (speed / 1024 / 1024).toFixed(2),
           },
         ]);
-
         if (receivedSizeRef.current === fileMetadataRef.current.size) {
           saveFile();
         }
       }
     };
+    channel.onopen = () => console.log("File channel opened");
+    channel.onclose = () => console.log("File channel closed");
   };
 
   const saveFile = () => {
-    const blob = new Blob(fileBufferRef.current);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = fileMetadataRef.current.name;
-    a.click();
-    URL.revokeObjectURL(url);
-
-    setMessages((prev) => [
-      ...prev,
-      {
-        type: "system",
-        text: `Downloaded: ${fileMetadataRef.current.name}`,
-      },
-    ]);
-
-    setTimeout(() => {
-      setTransferStats(null);
-      setSpeedData([]);
-    }, 3000);
+    try {
+      const blob = new Blob(fileBufferRef.current);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileMetadataRef.current.name || "download";
+      a.click();
+      URL.revokeObjectURL(url);
+      setMessages((p) => [
+        ...p,
+        { type: "system", text: `Downloaded: ${fileMetadataRef.current.name}` },
+      ]);
+    } finally {
+      setTimeout(() => {
+        setTransferStats(null);
+        setSpeedData([]);
+      }, 2000);
+    }
   };
 
-  const joinRoom = () => {
+  const joinRoom = async () => {
     if (!roomName.trim() || !serverOnline) return;
-
-    initializeSocket();
+    // connect socket once then emit join
+    if (!socketRef.current) return;
+    if (!socketRef.current.connected) socketRef.current.connect();
     socketRef.current.emit("join-room", roomName);
-    setIsConnected(true);
     setError("");
   };
 
   const sendMessage = () => {
-    if (!messageInput.trim() || !peerConnected) return;
-
+    if (!messageInput.trim() || !peerConnected || !dataChannelRef.current)
+      return;
     dataChannelRef.current.send(
-      JSON.stringify({
-        type: "message",
-        text: messageInput,
-      }),
+      JSON.stringify({ type: "message", text: messageInput }),
     );
-
-    setMessages((prev) => [...prev, { type: "sent", text: messageInput }]);
+    setMessages((p) => [...p, { type: "sent", text: messageInput }]);
     setMessageInput("");
     updateStatus("idle");
   };
@@ -325,10 +401,8 @@ export default function P2PFileSharing() {
   };
 
   const sendFile = async (file) => {
-    if (!peerConnected || !file) return;
-
+    if (!peerConnected || !file || !fileChannelRef.current) return;
     updateStatus("sending-file");
-
     const chunks = Math.ceil(file.size / CHUNK_SIZE);
     const metadata = {
       name: file.name,
@@ -336,139 +410,118 @@ export default function P2PFileSharing() {
       type: file.type,
       chunks,
     };
-
     fileChannelRef.current.send(JSON.stringify(metadata));
-
     let offset = 0;
     const reader = new FileReader();
-
     const readSlice = () => {
       const slice = file.slice(offset, offset + CHUNK_SIZE);
       reader.readAsArrayBuffer(slice);
     };
-
     reader.onload = (e) => {
       fileChannelRef.current.send(e.target.result);
       offset += e.target.result.byteLength;
-
       if (offset < file.size) {
         readSlice();
       } else {
-        setMessages((prev) => [
-          ...prev,
+        setMessages((p) => [
+          ...p,
           { type: "system", text: `Sent: ${file.name}` },
         ]);
         updateStatus("idle");
       }
     };
-
     readSlice();
   };
 
+  // Simple UI — liquid glass style (black / white / blue)
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 text-white p-4">
-      <div className="max-w-7xl mx-auto">
-        {/* Header */}
-        <div className="flex items-center justify-between mb-6 bg-white/10 backdrop-blur-lg rounded-2xl p-4 border border-white/20">
+    <div className="min-h-screen bg-black text-white p-6">
+      <div className="max-w-6xl mx-auto">
+        {/* Header - glass */}
+        <header className="flex items-center justify-between p-4 rounded-2xl bg-white/4 backdrop-blur-md border border-white/10 shadow-sm">
           <div className="flex items-center gap-3">
-            <div className="bg-gradient-to-r from-purple-500 to-pink-500 p-3 rounded-xl">
+            <div className="p-3 rounded-xl bg-gradient-to-br from-blue-600/30 to-white/5 border border-white/10">
               <Users className="w-6 h-6" />
             </div>
             <div>
-              <h1 className="text-2xl font-bold">P2P File Share</h1>
-              <p className="text-sm text-gray-300">
-                Secure peer-to-peer transfer
-              </p>
+              <h1 className="text-2xl font-semibold">P2P File Share</h1>
+              <p className="text-sm text-gray-300">Direct WebRTC file & chat</p>
             </div>
           </div>
 
-          <button
-            onClick={checkServerStatus}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-all ${
-              serverOnline
-                ? "bg-green-500/20 text-green-300 hover:bg-green-500/30"
-                : "bg-red-500/20 text-red-300 hover:bg-red-500/30"
-            }`}
-          >
-            {serverOnline ? (
-              <Wifi className="w-5 h-5" />
-            ) : (
-              <WifiOff className="w-5 h-5" />
-            )}
-            <span className="font-medium">
-              {serverOnline ? "Server Online" : "Server Offline"}
-            </span>
-          </button>
-        </div>
-
-        {!isConnected ? (
-          <div className="flex items-center justify-center min-h-[70vh]">
-            <div className="bg-white/10 backdrop-blur-xl rounded-3xl p-8 border border-white/20 max-w-md w-full transform hover:scale-105 transition-transform">
-              <div className="text-center mb-6">
-                <div className="bg-gradient-to-r from-purple-500 to-pink-500 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4">
-                  <Users className="w-8 h-8" />
-                </div>
-                <h2 className="text-3xl font-bold mb-2">Join a Room</h2>
-                <p className="text-gray-300">
-                  Enter a room name to connect with a peer
-                </p>
-              </div>
-
-              <input
-                type="text"
-                placeholder="e.g., physics-123"
-                value={roomName}
-                onChange={(e) => setRoomName(e.target.value)}
-                onKeyPress={(e) => e.key === "Enter" && joinRoom()}
-                className="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-3 mb-4 focus:outline-none focus:ring-2 focus:ring-purple-500 transition-all"
-                disabled={!serverOnline}
-              />
-
-              <button
-                onClick={joinRoom}
-                disabled={!serverOnline || !roomName.trim()}
-                className="w-full bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 disabled:from-gray-500 disabled:to-gray-600 rounded-xl py-3 font-semibold transition-all transform hover:scale-105 disabled:scale-100 disabled:cursor-not-allowed"
-              >
-                {serverOnline ? "Connect" : "Server Offline"}
-              </button>
-
-              {error && (
-                <div className="mt-4 flex items-center gap-2 text-yellow-300 bg-yellow-500/20 rounded-lg p-3">
-                  <AlertCircle className="w-5 h-5 flex-shrink-0" />
-                  <span className="text-sm">{error}</span>
-                </div>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={checkServerStatus}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-all border ${
+                serverOnline ? "border-blue-400/40" : "border-red-400/30"
+              }`}
+            >
+              {serverOnline ? (
+                <Wifi className="w-5 h-5" />
+              ) : (
+                <WifiOff className="w-5 h-5" />
               )}
+              <span className="font-medium text-sm">
+                {serverOnline ? "Server Online" : "Server Offline"}
+              </span>
+            </button>
+            <div className="text-sm text-gray-300">
+              Room:{" "}
+              <span className="font-mono text-blue-300">{roomName || "-"}</span>
             </div>
           </div>
-        ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Status Bar */}
-            <div className="lg:col-span-3 bg-white/10 backdrop-blur-lg rounded-2xl p-4 border border-white/20">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-4">
-                  <div className="flex items-center gap-2">
-                    <div
-                      className={`w-3 h-3 rounded-full ${peerConnected ? "bg-green-400 animate-pulse" : "bg-gray-400"}`}
-                    ></div>
-                    <span className="font-medium">
-                      {peerConnected ? "Connected" : "Connecting..."}
-                    </span>
+        </header>
+
+        <main className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {!isConnected ? (
+            <div className="lg:col-span-3 flex items-center justify-center min-h-[60vh]">
+              <div className="w-full max-w-md p-8 rounded-3xl bg-white/5 backdrop-blur-lg border border-white/10">
+                <h2 className="text-2xl font-semibold mb-2 text-white">
+                  Join a room
+                </h2>
+                <p className="text-sm text-gray-300 mb-4">
+                  Use the same room name to connect to a peer
+                </p>
+                <input
+                  value={roomName}
+                  onChange={(e) => setRoomName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && joinRoom()}
+                  placeholder="e.g., physics-123"
+                  className="w-full px-4 py-3 rounded-xl bg-black/40 border border-white/10 mb-4 focus:outline-none"
+                  disabled={!serverOnline}
+                />
+                <button
+                  onClick={joinRoom}
+                  disabled={!serverOnline || !roomName.trim()}
+                  className="w-full px-4 py-3 rounded-xl bg-blue-600/70 hover:bg-blue-600 transition disabled:opacity-50"
+                >
+                  Connect
+                </button>
+
+                {error && (
+                  <div className="mt-4 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-yellow-300 text-sm flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4" />
+                    <span>{error}</span>
                   </div>
-                  <div className="h-6 w-px bg-white/20"></div>
-                  <div className="text-sm text-gray-300">
-                    Room:{" "}
-                    <span className="font-mono text-purple-300">
-                      {roomName}
-                    </span>
+                )}
+              </div>
+            </div>
+          ) : (
+            <>
+              {/* Status bar */}
+              <div className="lg:col-span-3 p-4 rounded-2xl bg-white/4 backdrop-blur-md border border-white/10 flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div
+                    className={`w-3 h-3 rounded-full ${peerConnected ? "bg-blue-400 animate-pulse" : "bg-gray-600"}`}
+                  />
+                  <div className="text-sm">
+                    {peerConnected ? "Connected" : "Waiting for peer..."}
                   </div>
                 </div>
-
-                <div className="flex items-center gap-4 text-sm">
+                <div className="flex gap-6 text-sm text-gray-300">
                   <div>
                     You:{" "}
-                    <span className="text-purple-300 capitalize">
-                      {myStatus}
-                    </span>
+                    <span className="capitalize text-blue-300">{myStatus}</span>
                   </div>
                   <div>
                     Peer:{" "}
@@ -480,101 +533,84 @@ export default function P2PFileSharing() {
                   </div>
                 </div>
               </div>
-            </div>
 
-            {/* Chat Section */}
-            <div className="lg:col-span-2 bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 flex flex-col h-[600px]">
-              <div className="p-4 border-b border-white/20">
-                <h3 className="font-semibold text-lg">Chat</h3>
-              </div>
-
-              <div className="flex-1 overflow-y-auto p-4 space-y-3">
-                {messages.map((msg, idx) => (
-                  <div
-                    key={idx}
-                    className={`flex ${msg.type === "sent" ? "justify-end" : msg.type === "system" ? "justify-center" : "justify-start"}`}
-                  >
-                    <div
-                      className={`max-w-xs px-4 py-2 rounded-2xl ${
-                        msg.type === "sent"
-                          ? "bg-gradient-to-r from-purple-500 to-pink-500"
-                          : msg.type === "system"
-                            ? "bg-white/10 text-gray-300 text-sm"
-                            : "bg-white/20"
-                      }`}
-                    >
-                      {msg.text}
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              <div className="p-4 border-t border-white/20">
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    placeholder="Type a message..."
-                    value={messageInput}
-                    onChange={(e) => {
-                      setMessageInput(e.target.value);
-                      handleTyping();
-                    }}
-                    onKeyPress={(e) => e.key === "Enter" && sendMessage()}
-                    disabled={!peerConnected}
-                    className="flex-1 bg-white/10 border border-white/20 rounded-xl px-4 py-2 focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50"
-                  />
-                  <button
-                    onClick={sendMessage}
-                    disabled={!peerConnected || !messageInput.trim()}
-                    className="bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 disabled:from-gray-500 disabled:to-gray-600 rounded-xl px-4 py-2 transition-all disabled:cursor-not-allowed"
-                  >
-                    <Send className="w-5 h-5" />
-                  </button>
+              {/* Chat */}
+              <section className="lg:col-span-2 flex flex-col rounded-2xl bg-white/4 border border-white/10 h-[600px] overflow-hidden">
+                <div className="p-4 border-b border-white/6">
+                  <h3 className="font-semibold">Chat</h3>
                 </div>
-              </div>
-            </div>
-
-            {/* File Transfer Section */}
-            <div className="space-y-6">
-              <div className="bg-white/10 backdrop-blur-lg rounded-2xl p-4 border border-white/20">
-                <h3 className="font-semibold text-lg mb-4">Send File</h3>
-                <input
-                  type="file"
-                  onChange={(e) => sendFile(e.target.files[0])}
-                  disabled={!peerConnected}
-                  className="hidden"
-                  id="file-input"
-                />
-                <label
-                  htmlFor="file-input"
-                  className={`flex items-center justify-center gap-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 rounded-xl px-4 py-3 cursor-pointer transition-all ${
-                    !peerConnected && "opacity-50 cursor-not-allowed"
-                  }`}
-                >
-                  <Upload className="w-5 h-5" />
-                  <span className="font-medium">Choose File</span>
-                </label>
-              </div>
-
-              {transferStats && (
-                <div className="bg-white/10 backdrop-blur-lg rounded-2xl p-4 border border-white/20 animate-in fade-in">
-                  <div className="flex items-center gap-2 mb-4">
-                    <Download className="w-5 h-5 text-green-400 animate-bounce" />
-                    <h3 className="font-semibold">Receiving File</h3>
+                <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                  {messages.map((m, i) => (
+                    <div
+                      key={i}
+                      className={`flex ${m.type === "sent" ? "justify-end" : m.type === "system" ? "justify-center" : "justify-start"}`}
+                    >
+                      <div
+                        className={`max-w-xs px-4 py-2 rounded-2xl ${m.type === "sent" ? "bg-blue-600/60" : m.type === "system" ? "bg-white/6 text-gray-300 text-sm" : "bg-white/5"}`}
+                      >
+                        {m.text}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="p-4 border-t border-white/6">
+                  <div className="flex gap-2">
+                    <input
+                      value={messageInput}
+                      onChange={(e) => {
+                        setMessageInput(e.target.value);
+                        handleTyping();
+                      }}
+                      onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+                      placeholder="Type a message..."
+                      disabled={!peerConnected}
+                      className="flex-1 px-4 py-2 rounded-xl bg-black/40 border border-white/10"
+                    />
+                    <button
+                      onClick={sendMessage}
+                      disabled={!peerConnected || !messageInput.trim()}
+                      className="px-4 py-2 rounded-xl bg-blue-600/70"
+                    >
+                      <Send className="w-5 h-5" />
+                    </button>
                   </div>
+                </div>
+              </section>
 
-                  <div className="space-y-3">
-                    <div className="text-sm text-gray-300 truncate">
+              {/* File area */}
+              <aside className="space-y-6">
+                <div className="p-4 rounded-2xl bg-white/4 border border-white/10">
+                  <h3 className="font-semibold mb-3">Send File</h3>
+                  <input
+                    id="file-input"
+                    type="file"
+                    className="hidden"
+                    onChange={(e) => sendFile(e.target.files[0])}
+                  />
+                  <label
+                    htmlFor="file-input"
+                    className={`inline-flex items-center gap-2 px-4 py-3 rounded-xl cursor-pointer ${peerConnected ? "bg-blue-600/70" : "opacity-50 cursor-not-allowed"}`}
+                  >
+                    <Upload className="w-5 h-5" />
+                    <span className="font-medium">Choose File</span>
+                  </label>
+                </div>
+
+                {transferStats && (
+                  <div className="p-4 rounded-2xl bg-white/5 border border-white/8">
+                    <div className="flex items-center gap-2 mb-3">
+                      <Download className="w-5 h-5" />
+                      <h4 className="font-medium">Receiving File</h4>
+                    </div>
+                    <div className="text-sm text-gray-300 truncate mb-3">
                       {transferStats.fileName}
                     </div>
-
-                    <div className="bg-white/10 rounded-full h-2 overflow-hidden">
+                    <div className="bg-white/6 rounded-full h-2 overflow-hidden mb-3">
                       <div
-                        className="h-full bg-gradient-to-r from-green-500 to-emerald-500 transition-all duration-300"
+                        className="h-full bg-blue-400 transition-all"
                         style={{ width: `${transferStats.progress}%` }}
-                      ></div>
+                      />
                     </div>
-
                     <div className="grid grid-cols-2 gap-2 text-sm">
                       <div>
                         <div className="text-gray-400">Progress</div>
@@ -606,12 +642,12 @@ export default function P2PFileSharing() {
                     </div>
 
                     {speedData.length > 0 && (
-                      <div className="bg-white/5 rounded-lg p-2 mt-4">
-                        <ResponsiveContainer width="100%" height={150}>
+                      <div className="mt-4 bg-white/4 p-2 rounded-lg">
+                        <ResponsiveContainer width="100%" height={140}>
                           <LineChart data={speedData}>
                             <CartesianGrid
                               strokeDasharray="3 3"
-                              stroke="rgba(255,255,255,0.1)"
+                              stroke="rgba(255,255,255,0.06)"
                             />
                             <XAxis
                               dataKey="time"
@@ -626,13 +662,13 @@ export default function P2PFileSharing() {
                               contentStyle={{
                                 backgroundColor: "rgba(0,0,0,0.8)",
                                 border: "none",
-                                borderRadius: "8px",
+                                borderRadius: 8,
                               }}
                             />
                             <Line
                               type="monotone"
                               dataKey="speed"
-                              stroke="#10b981"
+                              stroke="#60A5FA"
                               strokeWidth={2}
                               dot={false}
                             />
@@ -641,11 +677,11 @@ export default function P2PFileSharing() {
                       </div>
                     )}
                   </div>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
+                )}
+              </aside>
+            </>
+          )}
+        </main>
       </div>
     </div>
   );
