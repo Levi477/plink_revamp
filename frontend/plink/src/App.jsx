@@ -45,6 +45,7 @@ export default function P2PFileSharing() {
   const fileMetadataRef = useRef(null);
   const startTimeRef = useRef(0);
   const roomIdRef = useRef(null);
+  const pendingIceCandidatesRef = useRef([]);
 
   const log = (message, data = null) => {
     const timestamp = new Date().toISOString().split("T")[1].slice(0, -1);
@@ -108,14 +109,15 @@ export default function P2PFileSharing() {
       log("Joined room", { room, position });
       setIsConnected(true);
       roomIdRef.current = room;
-      setError("");
+      setError(position === 2 ? "Connected. Waiting for peer..." : "");
     });
 
     socket.on("user-connected", ({ userId }) => {
-      log("User connected event received", userId);
+      log("User connected event received - initiating as offerer", userId);
       setError("Peer joined. Establishing connection...");
       setConnectionState("connecting");
 
+      // Small delay to ensure both sockets are ready
       setTimeout(() => {
         log("Creating peer connection as offerer");
         createPeerConnection(true);
@@ -124,19 +126,40 @@ export default function P2PFileSharing() {
 
     socket.on("offer", async ({ offer }) => {
       log("Received WebRTC offer");
+      setError("Received connection request...");
       setConnectionState("connecting");
 
+      // Create peer connection as answerer if not already created
       if (!peerConnectionRef.current) {
         log("Creating peer connection as answerer");
         await createPeerConnection(false);
       }
 
       try {
+        log("Setting remote description from offer");
         await peerConnectionRef.current.setRemoteDescription(
           new RTCSessionDescription(offer),
         );
-        log("Remote description set from offer");
+        log("Remote description set successfully");
 
+        // Process any pending ICE candidates
+        if (pendingIceCandidatesRef.current.length > 0) {
+          log(
+            `Processing ${pendingIceCandidatesRef.current.length} pending ICE candidates`,
+          );
+          for (const candidate of pendingIceCandidatesRef.current) {
+            try {
+              await peerConnectionRef.current.addIceCandidate(
+                new RTCIceCandidate(candidate),
+              );
+            } catch (e) {
+              log("Error adding pending ICE candidate", e.message);
+            }
+          }
+          pendingIceCandidatesRef.current = [];
+        }
+
+        // Create and send answer
         const answer = await peerConnectionRef.current.createAnswer();
         await peerConnectionRef.current.setLocalDescription(answer);
         log("Created and set local answer");
@@ -147,7 +170,8 @@ export default function P2PFileSharing() {
         });
         log("Sent answer to peer");
       } catch (e) {
-        log("Error handling offer", e.message);
+        log("Error handling offer", e);
+        setError("Failed to establish connection");
       }
     });
 
@@ -155,29 +179,64 @@ export default function P2PFileSharing() {
       log("Received WebRTC answer");
       if (peerConnectionRef.current) {
         try {
+          log("Setting remote description from answer");
           await peerConnectionRef.current.setRemoteDescription(
             new RTCSessionDescription(answer),
           );
-          log("Remote description set from answer");
+          log("Remote description set successfully from answer");
+
+          // Process any pending ICE candidates
+          if (pendingIceCandidatesRef.current.length > 0) {
+            log(
+              `Processing ${pendingIceCandidatesRef.current.length} pending ICE candidates`,
+            );
+            for (const candidate of pendingIceCandidatesRef.current) {
+              try {
+                await peerConnectionRef.current.addIceCandidate(
+                  new RTCIceCandidate(candidate),
+                );
+              } catch (e) {
+                log("Error adding pending ICE candidate", e.message);
+              }
+            }
+            pendingIceCandidatesRef.current = [];
+          }
         } catch (e) {
-          log("Error setting remote description", e.message);
+          log("Error setting remote description from answer", e);
+          setError("Failed to complete connection");
         }
       }
     });
 
     socket.on("ice-candidate", async ({ candidate }) => {
-      if (!candidate) return;
+      if (!candidate) {
+        log("Received null ICE candidate (end-of-candidates)");
+        return;
+      }
 
       log("Received ICE candidate");
+
       if (peerConnectionRef.current) {
-        try {
-          await peerConnectionRef.current.addIceCandidate(
-            new RTCIceCandidate(candidate),
-          );
-          log("ICE candidate added successfully");
-        } catch (e) {
-          log("Error adding ICE candidate", e.message);
+        const remoteDesc = peerConnectionRef.current.remoteDescription;
+
+        // Only add candidate if we have a remote description
+        if (remoteDesc && remoteDesc.type) {
+          try {
+            await peerConnectionRef.current.addIceCandidate(
+              new RTCIceCandidate(candidate),
+            );
+            log("ICE candidate added successfully");
+          } catch (e) {
+            log("Error adding ICE candidate", e.message);
+          }
+        } else {
+          // Buffer the candidate until we have a remote description
+          log("Buffering ICE candidate (no remote description yet)");
+          pendingIceCandidatesRef.current.push(candidate);
         }
+      } else {
+        log("Buffering ICE candidate (no peer connection yet)");
+        pendingIceCandidatesRef.current.push(candidate);
       }
     });
 
@@ -219,6 +278,7 @@ export default function P2PFileSharing() {
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" },
       ],
     });
 
@@ -226,11 +286,13 @@ export default function P2PFileSharing() {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        log("Local ICE candidate generated");
+        log("Local ICE candidate generated", event.candidate.candidate);
         socketRef.current.emit("ice-candidate", {
           roomId: roomIdRef.current,
           candidate: event.candidate,
         });
+      } else {
+        log("All local ICE candidates have been generated");
       }
     };
 
@@ -243,7 +305,7 @@ export default function P2PFileSharing() {
         setError("");
         setMessages((p) => [
           ...p,
-          { type: "system", text: "Connected to peer" },
+          { type: "system", text: "Connected to peer via WebRTC" },
         ]);
       } else if (
         pc.connectionState === "disconnected" ||
@@ -251,11 +313,21 @@ export default function P2PFileSharing() {
       ) {
         setPeerConnected(false);
         setError("Connection lost");
+      } else if (pc.connectionState === "closed") {
+        setPeerConnected(false);
       }
     };
 
     pc.oniceconnectionstatechange = () => {
-      log("ICE connection state", pc.iceConnectionState);
+      log("ICE connection state changed", pc.iceConnectionState);
+      if (pc.iceConnectionState === "failed") {
+        log("ICE connection failed - attempting restart");
+        pc.restartIce();
+      }
+    };
+
+    pc.onicegatheringstatechange = () => {
+      log("ICE gathering state changed", pc.iceGatheringState);
     };
 
     if (isOfferer) {
@@ -278,7 +350,8 @@ export default function P2PFileSharing() {
         });
         log("Sent offer to peer");
       } catch (e) {
-        log("Error creating offer", e.message);
+        log("Error creating offer", e);
+        setError("Failed to create connection offer");
       }
     } else {
       log("Waiting for data channels as answerer");
@@ -415,6 +488,8 @@ export default function P2PFileSharing() {
 
   const cleanupPeerConnection = () => {
     log("Cleaning up peer connection");
+
+    pendingIceCandidatesRef.current = [];
 
     if (dataChannelRef.current) {
       try {

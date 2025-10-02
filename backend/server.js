@@ -117,21 +117,20 @@ io.on("connection", (socket) => {
           `[JOIN-ROOM] ${socket.id} is waiting for peer in ${roomId}`,
         );
       } else if (room.length === 2) {
-        // Second user joined - notify both
+        // Second user joined - only notify FIRST user to initiate
         const [user1, user2] = room;
         console.log(
           `[JOIN-ROOM] Room ${roomId} now has 2 users: ${user1}, ${user2}`,
         );
 
-        // Notify first user about second user
+        // Only notify first user to create offer
         io.to(user1).emit("user-connected", { userId: user2 });
         io.to(user1).emit("joined-room", { room: roomId, position: 1 });
 
-        // Notify second user about first user
-        io.to(user2).emit("user-connected", { userId: user1 });
+        // Second user just joins and waits for offer
         io.to(user2).emit("joined-room", { room: roomId, position: 2 });
 
-        console.log(`[JOIN-ROOM] Both users notified in room ${roomId}`);
+        console.log(`[JOIN-ROOM] User1 will initiate connection to User2`);
       }
     } catch (err) {
       console.error(`[JOIN-ROOM] Error:`, err);
