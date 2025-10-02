@@ -21,7 +21,7 @@ import {
 import { io } from "socket.io-client";
 
 const CHUNK_SIZE = 256 * 1024;
-const SERVER_URL = "http://localhost:3001";
+const SERVER_URL = "https://plink-revamp-backend.onrender.com";
 
 export default function P2PFileSharing() {
   const [roomName, setRoomName] = useState("");
@@ -76,6 +76,7 @@ export default function P2PFileSharing() {
     log("Initializing socket connection");
     const socket = io(SERVER_URL, {
       transports: ["websocket", "polling"],
+      path: "/socket.io",
       reconnectionAttempts: 5,
       reconnectionDelay: 1000,
     });

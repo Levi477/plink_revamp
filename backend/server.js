@@ -7,6 +7,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" },
+  path: "/socket.io",
   transports: ["websocket", "polling"],
   pingInterval: 25000,
   pingTimeout: 60000,
