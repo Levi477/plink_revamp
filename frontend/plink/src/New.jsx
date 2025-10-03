@@ -30,8 +30,11 @@ import pako from "pako";
 // --- CONFIG ---
 const DEFAULT_CHUNK_SIZE = 256 * 1024;
 const SERVER_URL = "https://plink-revamp-backend.onrender.com";
+const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024; // 16MB backpressure threshold
+const CHUNK_REQUEST_TIMEOUT = 3000; // ms
+const CHUNK_REQUEST_MAX_RETRIES = 4;
 
-// --- IndexedDB functions (unchanged) ---
+// --- IndexedDB functions ---
 function openDb() {
   return new Promise((resolve, reject) => {
     const r = indexedDB.open("plink-file-transfer-db", 1);
@@ -69,29 +72,28 @@ async function saveFileMetadataIndexedDB(fileMeta) {
   });
 }
 
+// IMPORTANT FIX: return a full array of length totalChunks (with undefined slots) so we can detect missing chunks
 async function readAllChunksIndexedDB(fileId, totalChunks) {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(["chunks"], "readonly");
     const store = tx.objectStore("chunks");
     const chunks = new Array(totalChunks);
-    let got = 0;
 
     const req = store.openCursor();
     req.onsuccess = (e) => {
       const cursor = e.target.result;
       if (cursor) {
         const { fileId: fId, index, data } = cursor.value;
-        if (fId === fileId) {
+        if (fId === fileId && index >= 0 && index < totalChunks) {
           chunks[index] = data;
-          got++;
         }
         cursor.continue();
       }
     };
 
     tx.oncomplete = () => {
-      resolve(chunks.filter((c) => c));
+      resolve(chunks);
     };
     tx.onerror = () => reject(tx.error);
   });
@@ -116,7 +118,7 @@ async function deleteFileIndexedDB(fileId) {
   });
 }
 
-// --- Enhanced Starfield Background Component (unchanged) ---
+// --- Enhanced Starfield Background Component ---
 const Starfield = () => {
   const canvasRef = useRef(null);
   const mousePosRef = useRef({ x: 0, y: 0 });
@@ -196,7 +198,7 @@ const Starfield = () => {
   return <canvas ref={canvasRef} className="fixed inset-0 z-0" />;
 };
 
-// --- Helper Component for Animated Stats (unchanged) ---
+// --- Helper Component for Animated Stats ---
 const AnimatedStat = ({ value, unit }) => {
   return (
     <motion.span
@@ -210,7 +212,7 @@ const AnimatedStat = ({ value, unit }) => {
   );
 };
 
-// --- Helper Component for Radial Progress (unchanged) ---
+// --- Helper Component for Radial Progress ---
 const RadialProgress = ({ progress }) => {
   const radius = 50;
   const stroke = 8;
@@ -268,7 +270,7 @@ const RadialProgress = ({ progress }) => {
   );
 };
 
-// --- Settings Modal Component (unchanged) ---
+// --- Settings Modal Component ---
 const SettingsModal = ({ isOpen, onClose, settings, onSettingsChange }) => {
   const [localSettings, setLocalSettings] = useState(settings);
 
@@ -425,53 +427,12 @@ export default function P2PFileSharing() {
   const channelsReadyRef = useRef({ chat: false, file: false });
   const maxTimeRef = useRef(0);
 
-  // --- FIX: Add a ref to store promise resolvers for transfer completion ---
-  const transferCompletionResolversRef = useRef(new Map());
-
-  // --- NEW: Add helper function for robust ACK waiting ---
-  const waitForAck = useCallback((fileId, timeout = 45000) => {
-    return new Promise((resolve, reject) => {
-      const startTime = Date.now();
-
-      const checkInterval = setInterval(() => {
-        // Check if ACK was received
-        if (!transferCompletionResolversRef.current.has(fileId)) {
-          clearInterval(checkInterval);
-          resolve();
-          return;
-        }
-
-        // Check timeout
-        if (Date.now() - startTime > timeout) {
-          clearInterval(checkInterval);
-          transferCompletionResolversRef.current.delete(fileId);
-          reject(new Error(`ACK timeout for file: ${fileId}`));
-        }
-      }, 100);
-    });
-  }, []);
-
-  // --- NEW: Add transfer validation helper ---
-  const validateTransfer = useCallback(
-    (expectedSize, actualSize, expectedChunks, actualChunks) => {
-      const sizeMatch = Math.abs(expectedSize - actualSize) < 1024; // Within 1KB
-      const chunksMatch = expectedChunks === actualChunks;
-
-      if (!sizeMatch) {
-        log(`Size mismatch: expected ${expectedSize}, got ${actualSize}`, {
-          difference: expectedSize - actualSize,
-        });
-      }
-      if (!chunksMatch) {
-        log(
-          `Chunk count mismatch: expected ${expectedChunks}, got ${actualChunks}`,
-        );
-      }
-
-      return sizeMatch && chunksMatch;
-    },
-    [],
-  );
+  // New state for synchronization
+  const currentFileTransferRef = useRef(null);
+  // map of pending request keys -> { timeoutId, retries }
+  const pendingChunkRequestsRef = useRef(new Map());
+  // metadata map for binary pairing: key = `${fileId}:${chunkIndex}` -> meta
+  const pendingChunkMetaRef = useRef(new Map());
 
   const log = useCallback((message, data = null) => {
     const timestamp = new Date().toISOString().split("T")[1].slice(0, -1);
@@ -501,31 +462,153 @@ export default function P2PFileSharing() {
     return () => clearInterval(id);
   }, [error]);
 
-  const sendWithBackpressure = useCallback(
-    (channel, data) => {
-      return new Promise((resolve, reject) => {
-        const trySend = () => {
-          if (channel.readyState !== "open") {
-            return reject(new Error("Data channel is not open."));
+  // helper to wait for dataChannel backpressure to go below threshold
+  const waitForBufferLow = useCallback(async () => {
+    const channel = fileChannelRef.current;
+    if (!channel) return;
+    while (channel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+  }, []);
+
+  // Improved requestNextChunk -> tracks pending request and sets retry timer
+  const requestNextChunk = useCallback(
+    (fileId, chunkIndex) => {
+      if (
+        !fileChannelRef.current ||
+        fileChannelRef.current.readyState !== "open"
+      ) {
+        log("File channel not ready for chunk request");
+        return;
+      }
+
+      const key = `${fileId}:${chunkIndex}`;
+
+      if (pendingChunkRequestsRef.current.has(key)) {
+        // already requested
+        return;
+      }
+
+      const request = {
+        type: "request-chunk",
+        fileId,
+        chunkIndex,
+        timestamp: Date.now(),
+      };
+
+      log(`Requesting chunk ${chunkIndex} for file ${fileId}`);
+      try {
+        fileChannelRef.current.send(JSON.stringify(request));
+      } catch (e) {
+        log("Failed to send chunk request", e.message);
+      }
+
+      // set up retry timer
+      let retries = 0;
+      const scheduleRetry = () => {
+        const timeoutId = setTimeout(() => {
+          const entry = pendingChunkRequestsRef.current.get(key);
+          if (!entry) return; // already received
+
+          if (entry.retries >= CHUNK_REQUEST_MAX_RETRIES) {
+            // give up
+            log(`Chunk ${chunkIndex} for ${fileId} failed after retries`);
+            setError(`Failed to receive chunk ${chunkIndex} for ${fileId}`);
+            pendingChunkRequestsRef.current.delete(key);
+            return;
           }
-          const maxBuffer = settings.chunkSize * 16;
-          if (channel.bufferedAmount < maxBuffer) {
-            try {
-              channel.send(data);
-              resolve();
-            } catch (e) {
-              reject(e);
-            }
-          } else {
-            channel.addEventListener("bufferedamountlow", trySend, {
-              once: true,
-            });
+
+          entry.retries++;
+          log(`Re-requesting chunk ${chunkIndex} (retry ${entry.retries})`);
+          try {
+            fileChannelRef.current.send(JSON.stringify(request));
+          } catch (e) {
+            log("Failed to re-send chunk request", e.message);
           }
-        };
-        trySend();
-      });
+          scheduleRetry();
+        }, CHUNK_REQUEST_TIMEOUT);
+
+        pendingChunkRequestsRef.current.set(key, { timeoutId, retries });
+      };
+
+      scheduleRetry();
     },
-    [settings.chunkSize],
+    [log],
+  );
+
+  // New function to send chunk when requested: includes a metadata message before binary and observes backpressure
+  const sendRequestedChunk = useCallback(
+    async (fileId, chunkIndex) => {
+      const transfer = currentFileTransferRef.current;
+      if (!transfer || transfer.fileId !== fileId) {
+        log(`No active transfer found for file ${fileId}`);
+        return;
+      }
+
+      const { fileToSend, totalChunks, startTime } = transfer;
+
+      if (chunkIndex >= totalChunks) {
+        log(`Invalid chunk index requested: ${chunkIndex}`);
+        return;
+      }
+
+      try {
+        const offset = chunkIndex * settings.chunkSize;
+        const slice = fileToSend.slice(offset, offset + settings.chunkSize);
+        const arrayBuffer = await slice.arrayBuffer();
+
+        const chunkMeta = {
+          type: "chunk-meta",
+          fileId,
+          chunkIndex,
+          isLast: chunkIndex === totalChunks - 1,
+          length: arrayBuffer.byteLength,
+          timestamp: Date.now(),
+        };
+
+        // send meta first (string) so receiver knows which index the following binary belongs to
+        fileChannelRef.current.send(JSON.stringify(chunkMeta));
+
+        // wait for channel buffer to go down if necessary
+        await waitForBufferLow();
+
+        // then send binary
+        fileChannelRef.current.send(arrayBuffer);
+
+        // Update transfer stats
+        const newSentBytes = (chunkIndex + 1) * settings.chunkSize;
+        const elapsed = (Date.now() - startTime) / 1000;
+        const speed = newSentBytes / Math.max(elapsed, 0.001);
+        const progress = (newSentBytes / fileToSend.size) * 100;
+
+        setTransferStats((prev) => ({
+          ...prev,
+          sentSize: Math.min(newSentBytes, fileToSend.size),
+          progress,
+          speed,
+          chunks: chunkIndex + 1,
+        }));
+
+        if (elapsed > maxTimeRef.current) {
+          maxTimeRef.current = elapsed;
+          setSpeedData((prev) => [
+            ...prev,
+            {
+              time: parseFloat(elapsed.toFixed(1)),
+              speed: parseFloat((speed / 1024 / 1024).toFixed(2)),
+            },
+          ]);
+        }
+
+        transfer.sentChunks = chunkIndex + 1;
+
+        log(`Sent chunk ${chunkIndex} for file ${fileId}`);
+      } catch (error) {
+        log(`Error sending chunk ${chunkIndex}`, error.message);
+        setError(`Failed to send chunk: ${error.message}`);
+      }
+    },
+    [log, settings.chunkSize, waitForBufferLow],
   );
 
   const setupFileChannel = useCallback(
@@ -550,6 +633,15 @@ export default function P2PFileSharing() {
           ...p,
           { type: "system", text: "File channel disconnected" },
         ]);
+
+        // Clean up any ongoing transfers
+        currentFileTransferRef.current = null;
+        // clear pending timers
+        for (const [k, v] of pendingChunkRequestsRef.current.entries()) {
+          clearTimeout(v.timeoutId);
+        }
+        pendingChunkRequestsRef.current.clear();
+        pendingChunkMetaRef.current.clear();
       };
 
       channel.onerror = (e) => {
@@ -563,6 +655,7 @@ export default function P2PFileSharing() {
             const message = JSON.parse(ev.data);
 
             if (message.type === "file-metadata") {
+              // Handle file metadata (receiver side)
               const meta = message;
               log("Received file metadata", meta);
 
@@ -580,63 +673,143 @@ export default function P2PFileSharing() {
                 speed: 0,
                 chunks: 0,
                 totalChunks: meta.chunks || 0,
-                compressed: meta.compressed || false,
               });
               setSpeedData([]);
 
+              // Set up file saving
               if (window.showSaveFilePicker) {
                 try {
-                  // Remove .zip extension if it was added for compression
-                  const suggestedName =
-                    meta.compressed && meta.name.endsWith(".zip")
-                      ? meta.name.slice(0, -4)
-                      : meta.name;
-
                   const handle = await window.showSaveFilePicker({
-                    suggestedName: suggestedName,
+                    suggestedName: meta.name,
                   });
                   const writable = await handle.createWritable();
                   fileWriterMapRef.current[meta.fileId] = { writable, handle };
                 } catch (e) {
-                  log("User cancelled save picker or not supported", e.message);
-                  // Continue with IndexedDB fallback
+                  log(
+                    "User cancelled save picker or FS API unavailable",
+                    e.message,
+                  );
                 }
               }
+
               await saveFileMetadataIndexedDB({ fileId: meta.fileId, meta });
-            } else if (message.type === "transfer-complete-ack") {
-              log(`Received ACK for ${message.fileId}`);
-              const resolve = transferCompletionResolversRef.current.get(
-                message.fileId,
+
+              // Request the first chunk
+              requestNextChunk(meta.fileId, 0);
+            } else if (message.type === "request-chunk") {
+              // Handle chunk request (sender side)
+              log(
+                `Received chunk request for file ${message.fileId}, chunk ${message.chunkIndex}`,
               );
-              if (resolve) {
-                resolve(); // This signals the sender's sendFile function to proceed
-                transferCompletionResolversRef.current.delete(message.fileId);
-              }
+              sendRequestedChunk(message.fileId, message.chunkIndex);
+            } else if (message.type === "transfer-complete") {
+              // Handle transfer completion (sender side)
+              log(`File transfer completed: ${message.fileId}`);
+              setMessages((p) => [
+                ...p,
+                { type: "system", text: `Sent: ${message.fileName}` },
+              ]);
+
+              setTimeout(() => {
+                setTransferStats(null);
+                setSpeedData([]);
+                maxTimeRef.current = 0;
+                currentFileTransferRef.current = null;
+              }, 3000);
+            } else if (message.type === "transfer-error") {
+              // Handle transfer error
+              log(`Transfer error: ${message.error}`);
+              setError(`Transfer failed: ${message.error}`);
+              setTransferStats(null);
+              setSpeedData([]);
+              currentFileTransferRef.current = null;
+            } else if (message.type === "chunk-meta") {
+              // Pairing metadata for next binary chunk
+              const key = `${message.fileId}:${message.chunkIndex}`;
+              pendingChunkMetaRef.current.set(key, message);
+              // If someone was waiting on this key, the binary will use it.
             }
           } else {
             // Handle binary chunk data (receiver side)
             const buf = ev.data;
-            const fileIds = Object.keys(fileMetaRef.current || {});
-            if (fileIds.length === 0) return;
-            const fileId = fileIds[0];
+            const fileId = Object.keys(fileMetaRef.current || {})[0];
+            if (!fileId || !fileMetaRef.current[fileId]) return;
 
-            if (!fileMetaRef.current[fileId]) return;
-
-            const currentChunkIndex = receivedCountRef.current[fileId];
-            receivedCountRef.current[fileId]++;
-            const receivedChunks = receivedCountRef.current[fileId];
-
-            const fw = fileWriterMapRef.current[fileId];
-            if (fw && fw.writable) {
-              await fw.writable.write(new Uint8Array(buf));
+            // determine chunk index: prefer explicit chunk-meta pairing, otherwise fall back to sequential counter
+            const expectedIndex = receivedCountRef.current[fileId] || 0;
+            let usedIndex = undefined;
+            const preferKey = `${fileId}:${expectedIndex}`;
+            if (pendingChunkMetaRef.current.has(preferKey)) {
+              usedIndex = expectedIndex;
+              pendingChunkMetaRef.current.delete(preferKey);
             } else {
-              await storeChunkIndexedDB(fileId, currentChunkIndex, buf);
+              // find any meta for this file
+              const entries = Array.from(
+                pendingChunkMetaRef.current.entries(),
+              ).filter(([k]) => k.startsWith(`${fileId}:`));
+              if (entries.length > 0) {
+                // pick the smallest index available
+                entries.sort((a, b) => a[1].chunkIndex - b[1].chunkIndex);
+                usedIndex = entries[0][1].chunkIndex;
+                pendingChunkMetaRef.current.delete(entries[0][0]);
+              } else {
+                // fallback to sequential
+                usedIndex = expectedIndex;
+              }
             }
+
+            // clear any pending retry timer for this chunk
+            const key = `${fileId}:${usedIndex}`;
+            const pending = pendingChunkRequestsRef.current.get(key);
+            if (pending) {
+              clearTimeout(pending.timeoutId);
+              pendingChunkRequestsRef.current.delete(key);
+            }
+
+            // Store the chunk
+            const fw = fileWriterMapRef.current[fileId];
+            try {
+              if (fw && fw.writable) {
+                // try positional write (File System Access API) if supported to avoid ordering issues
+                try {
+                  await fw.writable.write({
+                    type: "write",
+                    position: usedIndex * settings.chunkSize,
+                    data: new Uint8Array(buf),
+                  });
+                } catch (e) {
+                  // fallback to append-write if positional not supported
+                  await fw.writable.write(new Uint8Array(buf));
+                }
+              } else {
+                await storeChunkIndexedDB(fileId, usedIndex, buf);
+              }
+            } catch (writeError) {
+              log("Error writing chunk", {
+                index: usedIndex,
+                error: writeError.message,
+              });
+            }
+
+            // increment received counter only if this was the expected sequential index
+            if (usedIndex === expectedIndex) {
+              receivedCountRef.current[fileId] =
+                (receivedCountRef.current[fileId] || 0) + 1;
+            } else {
+              // if out-of-order chunk, we still count total chunks received separately
+              receivedCountRef.current[fileId] =
+                (receivedCountRef.current[fileId] || 0) + 1;
+            }
+
+            const receivedChunks = Object.values(
+              receivedCountRef.current,
+            ).reduce((a, b) => a + b, 0); // not perfect but used only for UI
 
             // Update stats
             setTransferStats((prevStats) => {
               if (!prevStats) return prevStats;
-              const newReceived = prevStats.receivedSize + buf.byteLength;
+              const newReceived =
+                (prevStats.receivedSize || 0) + buf.byteLength;
               const totalSize = fileMetaRef.current[fileId].size;
               const elapsed = Math.max(
                 (Date.now() - startTimeRef.current) / 1000,
@@ -644,246 +817,204 @@ export default function P2PFileSharing() {
               );
               const speed = newReceived / elapsed;
               const progress = (newReceived / totalSize) * 100;
+
               return {
                 ...prevStats,
                 receivedSize: newReceived,
                 progress,
                 speed,
-                chunks: receivedChunks,
+                chunks: (prevStats.chunks || 0) + 1,
               };
             });
 
             const elapsed = (Date.now() - startTimeRef.current) / 1000;
+            const currentSpeed =
+              (receivedCountRef.current[fileId] * settings.chunkSize) /
+              Math.max(elapsed, 0.001);
+
             if (elapsed > maxTimeRef.current) {
               maxTimeRef.current = elapsed;
-              const speed =
-                (receivedCountRef.current[fileId] * settings.chunkSize) /
-                Math.max(elapsed, 0.001);
               setSpeedData((prev) => [
                 ...prev,
                 {
                   time: parseFloat(elapsed.toFixed(1)),
-                  speed: parseFloat((speed / 1024 / 1024).toFixed(2)),
+                  speed: parseFloat((currentSpeed / 1024 / 1024).toFixed(2)),
                 },
               ]);
             }
 
             const totalChunks = fileMetaRef.current[fileId].chunks;
 
-            if (
-              receivedChunks >= totalChunks &&
+            // If we believe we have received all chunks (count) -> attempt assemble / check for missing parts
+            // Note: we use stored chunks in IndexedDB to verify
+            const storedChunksCount = null; // placeholder if additional tracking desired
+
+            // Request next chunk(s)
+            // Find the next index that was not requested/received yet
+            const nextIndex = await (async () => {
+              // build a quick set of stored indices by checking pendingChunkMetaRef and receipt counter
+              const seq = receivedCountRef.current[fileId] || 0;
+              return seq; // simple sequential approach: ask for the next sequential index
+            })();
+
+            if ((receivedCountRef.current[fileId] || 0) < totalChunks) {
+              requestNextChunk(fileId, receivedCountRef.current[fileId] || 0);
+            } else if (
+              (receivedCountRef.current[fileId] || 0) >= totalChunks &&
               !isFinalizingRef.current[fileId]
             ) {
+              // All chunks *reported* received - now verify and finalize
               isFinalizingRef.current[fileId] = true;
-              log("All chunks received - finalizing", { fileId });
+              log("All chunks received - finalizing", {
+                fileId,
+                receivedChunks: receivedCountRef.current[fileId],
+                totalChunks,
+              });
 
-              try {
-                // --- NEW: Handle decompression if file was compressed ---
-                const meta = fileMetaRef.current[fileId];
-                let finalBlob;
+              // small pause to let any last writes finish
+              await new Promise((resolve) => setTimeout(resolve, 150));
 
-                if (fw && fw.writable) {
-                  // FileSystem API path
-                  await fw.writable.close();
+              const fwLocal = fw;
+
+              if (fwLocal && fwLocal.writable) {
+                try {
+                  await fwLocal.writable.close();
                   log("File saved via FileSystem API");
+                  setMessages((p) => [
+                    ...p,
+                    {
+                      type: "system",
+                      text: `Downloaded: ${fileMetaRef.current[fileId].name}`,
+                    },
+                  ]);
+                  await deleteFileIndexedDB(fileId);
+                } catch (e) {
+                  log("Error closing writable stream", e);
+                  setError("Failed to save file: " + e.message);
+                }
+              } else {
+                // read all chunks and verify there are no gaps
+                const chunksArr = await readAllChunksIndexedDB(
+                  fileId,
+                  totalChunks,
+                );
+                const missing = [];
+                for (let i = 0; i < totalChunks; i++) {
+                  if (!chunksArr[i]) missing.push(i);
+                }
 
-                  // For FileSystem API, we need to handle decompression by reading back the file
-                  if (meta.compressed) {
-                    setMessages((p) => [
-                      ...p,
-                      { type: "system", text: "Decompressing file..." },
-                    ]);
-
-                    const file = await fw.handle.getFile();
-                    const arrayBuffer = await file.arrayBuffer();
-                    const decompressed = pako.inflate(
-                      new Uint8Array(arrayBuffer),
-                    );
-
-                    // Create new file with decompressed content
-                    const newHandle = await window.showSaveFilePicker({
-                      suggestedName: meta.name.endsWith(".zip")
-                        ? meta.name.slice(0, -4)
-                        : meta.name,
-                    });
-                    const newWritable = await newHandle.createWritable();
-                    await newWritable.write(decompressed);
-                    await newWritable.close();
-
-                    // Remove the original compressed file
-                    await fw.handle.remove();
-
-                    log("File decompressed and saved");
-                    setMessages((p) => [
-                      ...p,
-                      {
-                        type: "system",
-                        text: `Downloaded and decompressed: ${meta.name}`,
-                      },
-                    ]);
-                  } else {
-                    setMessages((p) => [
-                      ...p,
-                      {
-                        type: "system",
-                        text: `Downloaded: ${meta.name}`,
-                      },
-                    ]);
-                  }
-                } else {
-                  // IndexedDB path
-                  const chunksArr = await readAllChunksIndexedDB(
-                    fileId,
-                    totalChunks,
-                  );
-                  if (chunksArr.length === totalChunks) {
-                    let blobData = chunksArr;
-
-                    // --- NEW: Decompress if needed ---
-                    if (meta.compressed) {
-                      setMessages((p) => [
-                        ...p,
-                        { type: "system", text: "Decompressing file..." },
-                      ]);
-
-                      // Combine all chunks into single array buffer for decompression
-                      const totalSize = chunksArr.reduce(
-                        (sum, chunk) => sum + chunk.byteLength,
-                        0,
-                      );
-                      const combined = new Uint8Array(totalSize);
-                      let offset = 0;
-                      chunksArr.forEach((chunk) => {
-                        combined.set(new Uint8Array(chunk), offset);
-                        offset += chunk.byteLength;
-                      });
-
-                      // Decompress
-                      const decompressed = pako.inflate(combined);
-                      blobData = [decompressed.buffer];
-
-                      log("File decompressed from chunks", {
-                        original: totalSize,
-                        decompressed: decompressed.length,
-                      });
-                    }
-
-                    finalBlob = new Blob(blobData, {
-                      type: meta.mimeType || "application/octet-stream",
+                if (missing.length === 0) {
+                  try {
+                    const blob = new Blob(chunksArr, {
+                      type:
+                        fileMetaRef.current[fileId].mimeType ||
+                        "application/octet-stream",
                     });
 
-                    const url = URL.createObjectURL(finalBlob);
+                    const url = URL.createObjectURL(blob);
                     const a = document.createElement("a");
+                    a.style.display = "none";
                     a.href = url;
-
-                    // Use original name (remove .zip if it was added for compression)
-                    const downloadName =
-                      meta.compressed && meta.name.endsWith(".zip")
-                        ? meta.name.slice(0, -4)
-                        : meta.name;
-                    a.download = downloadName;
-
+                    a.download = fileMetaRef.current[fileId].name || "download";
                     document.body.appendChild(a);
                     a.click();
+
                     setTimeout(() => {
                       document.body.removeChild(a);
                       URL.revokeObjectURL(url);
                     }, 100);
 
+                    log("File download triggered successfully");
                     setMessages((p) => [
                       ...p,
                       {
                         type: "system",
-                        text: `Downloaded${meta.compressed ? " and decompressed" : ""}: ${downloadName}`,
+                        text: `Downloaded: ${fileMetaRef.current[fileId].name}`,
                       },
                     ]);
-                  } else {
-                    setError(
-                      `Incomplete transfer: Expected ${totalChunks}, got ${chunksArr.length}`,
-                    );
-                    throw new Error(
-                      `Incomplete transfer: Expected ${totalChunks}, got ${chunksArr.length}`,
-                    );
+                    await deleteFileIndexedDB(fileId);
+                  } catch (e) {
+                    log("Error creating download", e);
+                    setError("Failed to download file: " + e.message);
                   }
-                }
-
-                // Validate transfer completeness
-                const isValid = validateTransfer(
-                  meta.size,
-                  finalBlob ? finalBlob.size : meta.compressedSize,
-                  meta.chunks,
-                  receivedChunks,
-                );
-
-                if (!isValid) {
-                  log("Transfer validation failed", {
-                    expectedSize: meta.size,
-                    actualSize: finalBlob
-                      ? finalBlob.size
-                      : meta.compressedSize,
-                    expectedChunks: meta.chunks,
-                    actualChunks: receivedChunks,
-                  });
+                } else {
+                  // There are missing chunks -> re-request them instead of failing
+                  log("Missing chunks detected - re-requesting", { missing });
                   setError(
-                    "Transfer validation failed - file may be corrupted",
+                    `Missing ${missing.length} chunks, re-requesting...`,
                   );
+                  // un-finalize so we can continue
+                  isFinalizingRef.current[fileId] = false;
+                  for (const idx of missing) {
+                    requestNextChunk(fileId, idx);
+                  }
+                  return;
                 }
-
-                // --- FIX: Send acknowledgment ONLY AFTER successful processing and saving ---
-                const completeMessage = {
-                  type: "transfer-complete-ack",
-                  fileId,
-                };
-                if (
-                  fileChannelRef.current &&
-                  fileChannelRef.current.readyState === "open"
-                ) {
-                  fileChannelRef.current.send(JSON.stringify(completeMessage));
-                  log("Sent transfer completion ACK");
-                }
-              } catch (processingError) {
-                log(
-                  "Error during file processing/saving",
-                  processingError.message,
-                );
-                setError("File processing error: " + processingError.message);
-
-                // Don't send ACK if processing failed
-                return;
-              } finally {
-                // Cleanup regardless of success/failure
-                await deleteFileIndexedDB(fileId);
-                delete fileMetaRef.current[fileId];
-                delete receivedCountRef.current[fileId];
-                delete fileWriterMapRef.current[fileId];
-                delete isFinalizingRef.current[fileId];
               }
+
+              // Clean up
+              delete fileMetaRef.current[fileId];
+              delete receivedCountRef.current[fileId];
+              delete fileWriterMapRef.current[fileId];
+              delete isFinalizingRef.current[fileId];
 
               setTimeout(() => {
                 setTransferStats(null);
                 setSpeedData([]);
                 maxTimeRef.current = 0;
               }, 3000);
+
+              // Notify sender that transfer is complete
+              const completeMessage = {
+                type: "transfer-complete",
+                fileId,
+                fileName: fileMetaRef.current[fileId]?.name || "Unknown",
+              };
+              try {
+                fileChannelRef.current.send(JSON.stringify(completeMessage));
+              } catch (e) {
+                log("Failed to notify sender about completion", e.message);
+              }
             }
           }
         } catch (e) {
           log("Error handling incoming file channel message", e.message);
           setError("File receive error: " + e.message);
+
+          // Notify sender of error
+          const errorMessage = {
+            type: "transfer-error",
+            fileId: Object.keys(fileMetaRef.current || {})[0],
+            error: e.message,
+          };
+          try {
+            fileChannelRef.current.send(JSON.stringify(errorMessage));
+          } catch (e2) {
+            log("Failed to send transfer-error", e2.message);
+          }
         }
       };
     },
-    [log, settings.chunkSize, validateTransfer],
+    [
+      log,
+      settings.chunkSize,
+      requestNextChunk,
+      sendRequestedChunk,
+      waitForBufferLow,
+    ],
   );
 
   const setupChatChannel = useCallback(
     (channel) => {
       log("Setting up chat channel");
       dataChannelRef.current = channel;
+
       channel.onopen = () => {
         log("Chat channel opened");
         channelsReadyRef.current.chat = true;
         setMessages((p) => [...p, { type: "system", text: "Chat ready" }]);
       };
+
       channel.onmessage = (ev) => {
         try {
           const data = JSON.parse(ev.data);
@@ -894,10 +1025,12 @@ export default function P2PFileSharing() {
           log("Error parsing chat message", e);
         }
       };
+
       channel.onclose = () => {
         log("Chat channel closed");
         channelsReadyRef.current.chat = false;
       };
+
       channel.onerror = (e) => {
         log("Chat channel error", e);
       };
@@ -910,14 +1043,18 @@ export default function P2PFileSharing() {
       if (peerConnectionRef.current) {
         peerConnectionRef.current.close();
       }
+
       channelsReadyRef.current = { chat: false, file: false };
+
       const pc = new RTCPeerConnection({
         iceServers: [
           { urls: "stun:stun.l.google.com:19302" },
           { urls: "stun:stun1.l.google.com:19302" },
         ],
       });
+
       peerConnectionRef.current = pc;
+
       pc.onicecandidate = (event) => {
         if (event.candidate) {
           socketRef.current.emit("ice-candidate", {
@@ -926,6 +1063,7 @@ export default function P2PFileSharing() {
           });
         }
       };
+
       pc.onconnectionstatechange = () => {
         log("Connection state changed", pc.connectionState);
         setConnectionState(pc.connectionState);
@@ -944,17 +1082,22 @@ export default function P2PFileSharing() {
           if (pc.connectionState !== "closed") setError("Connection lost");
         }
       };
+
       pc.oniceconnectionstatechange = () => {
         if (pc.iceConnectionState === "failed") {
           pc.restartIce();
         }
       };
+
       if (isOfferer) {
         const chatChannel = pc.createDataChannel("chat");
         setupChatChannel(chatChannel);
-        const fileChannel = pc.createDataChannel("file", { ordered: true });
-        fileChannel.bufferedAmountLowThreshold = settings.chunkSize * 4;
+
+        const fileChannel = pc.createDataChannel("file", {
+          ordered: true,
+        });
         setupFileChannel(fileChannel);
+
         try {
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
@@ -969,16 +1112,14 @@ export default function P2PFileSharing() {
         }
       } else {
         pc.ondatachannel = (event) => {
-          if (event.channel.label === "chat") {
-            setupChatChannel(event.channel);
-          } else if (event.channel.label === "file") {
-            event.channel.bufferedAmountLowThreshold = settings.chunkSize * 4;
+          if (event.channel.label === "chat") setupChatChannel(event.channel);
+          else if (event.channel.label === "file") {
             setupFileChannel(event.channel);
           }
         };
       }
     },
-    [log, setupFileChannel, setupChatChannel, settings.chunkSize],
+    [log, setupFileChannel, setupChatChannel],
   );
 
   const cleanupPeerConnection = () => {
@@ -991,21 +1132,39 @@ export default function P2PFileSharing() {
     peerConnectionRef.current = null;
     setPeerConnected(false);
     channelsReadyRef.current = { chat: false, file: false };
+
+    // Clean up transfer state
+    currentFileTransferRef.current = null;
+    for (const [k, v] of pendingChunkRequestsRef.current.entries()) {
+      clearTimeout(v.timeoutId);
+    }
+    pendingChunkRequestsRef.current.clear();
+    pendingChunkMetaRef.current.clear();
   };
 
   const sendFile = useCallback(
     async (file) => {
-      if (
-        !file ||
-        !fileChannelRef.current ||
-        fileChannelRef.current.readyState !== "open"
-      ) {
-        setError(
-          `File channel not ready. State: ${fileChannelRef.current?.readyState}`,
-        );
+      if (!file) {
+        log("No file provided to sendFile");
         return;
       }
+
+      if (!fileChannelRef.current) {
+        setError("File channel not initialized");
+        log("File channel not initialized");
+        return;
+      }
+
+      if (fileChannelRef.current.readyState !== "open") {
+        setError(
+          `File channel not ready. State: ${fileChannelRef.current.readyState}`,
+        );
+        log("File channel not ready", fileChannelRef.current.readyState);
+        return;
+      }
+
       log("Starting file transfer", { name: file.name, size: file.size });
+
       let fileToSend = file;
       let isCompressed = false;
       let originalSize = file.size;
@@ -1016,42 +1175,52 @@ export default function P2PFileSharing() {
             ...p,
             { type: "system", text: "Compressing file..." },
           ]);
+
           const arrayBuffer = await file.arrayBuffer();
           const compressed = pako.deflate(new Uint8Array(arrayBuffer));
-          fileToSend = new File([compressed], file.name + ".zip", {
+          fileToSend = new File([compressed], file.name, {
             type: "application/octet-stream",
           });
           isCompressed = true;
+
           log("File compressed", {
             original: originalSize,
             compressed: fileToSend.size,
+            ratio: ((fileToSend.size / originalSize) * 100).toFixed(1) + "%",
           });
         } catch (e) {
           log("Compression failed, sending uncompressed", e);
         }
       }
+
       const totalChunks = Math.ceil(fileToSend.size / settings.chunkSize);
       const fileId = `${Date.now()}-${file.name}`;
-
-      // Enhanced metadata with compression info
       const metadata = {
         type: "file-metadata",
         fileId,
-        name: isCompressed ? `${file.name}.zip` : file.name,
+        name: file.name,
         size: originalSize,
         mimeType: file.type,
         chunks: totalChunks,
         compressed: isCompressed,
-        compressedSize: isCompressed ? fileToSend.size : originalSize,
-        timestamp: Date.now(),
       };
 
       try {
         log("Sending file metadata", metadata);
         fileChannelRef.current.send(JSON.stringify(metadata));
+
         const startTime = Date.now();
         maxTimeRef.current = 0;
-        let sentBytes = 0;
+
+        // Set up current transfer state
+        currentFileTransferRef.current = {
+          fileId,
+          fileToSend,
+          totalChunks,
+          sentChunks: 0,
+          startTime,
+        };
+
         setTransferStats({
           fileName: file.name,
           totalSize: originalSize,
@@ -1060,150 +1229,72 @@ export default function P2PFileSharing() {
           speed: 0,
           chunks: 0,
           totalChunks,
-          compressed: isCompressed,
         });
         setSpeedData([]);
 
-        for (let index = 0; index < totalChunks; index++) {
-          if (fileChannelRef.current.readyState !== "open") {
-            throw new Error("File channel closed during transfer");
-          }
-          const offset = index * settings.chunkSize;
-          const slice = fileToSend.slice(offset, offset + settings.chunkSize);
-          const arrayBuffer = await slice.arrayBuffer();
-          await sendWithBackpressure(fileChannelRef.current, arrayBuffer);
-          sentBytes += arrayBuffer.byteLength;
-          const elapsed = (Date.now() - startTime) / 1000;
-          const speed = sentBytes / Math.max(elapsed, 0.001);
-          const progress = (sentBytes / fileToSend.size) * 100;
-          setTransferStats((prev) => ({
-            ...prev,
-            sentSize: Math.min(sentBytes, fileToSend.size),
-            progress,
-            speed,
-            chunks: index + 1,
-          }));
-          if (elapsed > maxTimeRef.current) {
-            maxTimeRef.current = elapsed;
-            setSpeedData((prev) => [
-              ...prev,
-              {
-                time: parseFloat(elapsed.toFixed(1)),
-                speed: parseFloat((speed / 1024 / 1024).toFixed(2)),
-              },
-            ]);
-          }
-        }
-
-        log(
-          `All chunks queued for ${file.name}. Waiting for receiver acknowledgment...`,
-        );
-        setMessages((p) => [
-          ...p,
-          {
-            type: "system",
-            text: `Sent: ${file.name}. Waiting for confirmation...`,
-          },
-        ]);
-
-        // --- ENHANCED: Robust ACK waiting with timeout and retry ---
-        try {
-          await waitForAck(fileId, 45000); // 45 second timeout
-          log(`ACK received. Transfer for ${file.name} is complete.`);
-
-          setMessages((p) => {
-            const newMessages = [...p];
-            // Update the waiting message to complete
-            const lastMsgIndex = newMessages.length - 1;
-            if (
-              newMessages[lastMsgIndex]?.text.includes(
-                "Waiting for confirmation",
-              )
-            ) {
-              newMessages[lastMsgIndex] = {
-                type: "system",
-                text: `Transfer completed: ${file.name}`,
-              };
-            }
-            return newMessages;
-          });
-        } catch (ackError) {
-          log("ACK timeout or error", ackError.message);
-          setError(`Transfer incomplete: ${ackError.message}`);
-
-          setMessages((p) => [
-            ...p,
-            {
-              type: "system",
-              text: `Transfer failed: ${file.name} - ${ackError.message}`,
-            },
-          ]);
-        } finally {
-          // Cleanup regardless of ACK status
-          setTimeout(() => {
-            setTransferStats(null);
-            setSpeedData([]);
-            maxTimeRef.current = 0;
-          }, 3000);
-
-          // Clean up the resolver
-          transferCompletionResolversRef.current.delete(fileId);
-        }
+        log(`File transfer initiated. Waiting for chunk requests...`);
       } catch (e) {
-        log("File transfer failed", e.message);
+        log("File transfer setup failed", e.message);
         setError("Failed to send file: " + e.message);
         setTransferStats(null);
         setSpeedData([]);
         maxTimeRef.current = 0;
-        transferCompletionResolversRef.current.delete(fileId);
+        currentFileTransferRef.current = null;
       }
     },
-    [
-      log,
-      settings.chunkSize,
-      settings.compression,
-      sendWithBackpressure,
-      waitForAck,
-    ],
+    [log, settings.chunkSize, settings.compression],
   );
 
   const sendFolder = useCallback(
     async (files) => {
       if (!files || files.length === 0) {
+        log("sendFolder called with no files");
         return;
       }
+
       setIsZipping(true);
+
       try {
         const filesArray = Array.from(files);
+
         if (filesArray.length === 0) {
           setError("No files selected");
           setIsZipping(false);
           return;
         }
+
         setMessages((p) => [
           ...p,
           { type: "system", text: `Zipping ${filesArray.length} files...` },
         ]);
+
         const JSZip = (await import("jszip")).default;
         const zip = new JSZip();
+
         let folderName = "folder";
-        if (filesArray[0]?.webkitRelativePath) {
-          folderName =
-            filesArray[0].webkitRelativePath.split("/")[0] || folderName;
-        } else if (filesArray.length > 1) {
-          folderName = "files";
+        if (filesArray[0]) {
+          if (filesArray[0].webkitRelativePath) {
+            const parts = filesArray[0].webkitRelativePath.split("/");
+            if (parts.length > 1) {
+              folderName = parts[0];
+            }
+          } else if (filesArray.length > 1) {
+            folderName = "files";
+          }
         }
+
         for (let i = 0; i < filesArray.length; i++) {
           const file = filesArray[i];
           const path = file.webkitRelativePath || file.name;
+
           const arrayBuffer = await file.arrayBuffer();
           zip.file(path, arrayBuffer);
+
           if (i % 10 === 0 || i === filesArray.length - 1) {
             setMessages((p) => {
               const newMessages = [...p];
-              if (
-                newMessages[newMessages.length - 1]?.text.includes("Zipping")
-              ) {
+              const lastMsg = newMessages[newMessages.length - 1];
+              if (lastMsg && lastMsg.text.includes("Zipping")) {
                 newMessages[newMessages.length - 1] = {
                   type: "system",
                   text: `Zipping ${i + 1}/${filesArray.length} files...`,
@@ -1214,18 +1305,28 @@ export default function P2PFileSharing() {
             await new Promise((resolve) => setTimeout(resolve, 0));
           }
         }
+
         setMessages((p) => [
           ...p.slice(0, -1),
           { type: "system", text: "Generating zip file..." },
         ]);
+
         const zipBlob = await zip.generateAsync({
           type: "blob",
           compression: "DEFLATE",
           compressionOptions: { level: 6 },
         });
+
         const zipFile = new File([zipBlob], `${folderName}.zip`, {
           type: "application/zip",
         });
+
+        log("Folder zipped", {
+          files: filesArray.length,
+          zipSize: zipFile.size,
+          name: zipFile.name,
+        });
+
         setMessages((p) => [
           ...p.slice(0, -1),
           {
@@ -1233,6 +1334,7 @@ export default function P2PFileSharing() {
             text: `Zip created: ${(zipFile.size / 1024 / 1024).toFixed(2)} MB`,
           },
         ]);
+
         setIsZipping(false);
         await sendFile(zipFile);
       } catch (error) {
@@ -1281,7 +1383,9 @@ export default function P2PFileSharing() {
       reconnectionAttempts: 5,
       reconnectionDelay: 1000,
     });
+
     socketRef.current = socket;
+
     socket.on("connect", () => log("Socket connected", socket.id));
     socket.on("connect_error", (err) => {
       log("Socket connect_error", err.message);
@@ -1385,6 +1489,7 @@ export default function P2PFileSharing() {
       setError(message);
       setConnectionState("error");
     });
+
     return () => {
       log("Cleaning up socket connection");
       if (socketRef.current) {
@@ -1403,22 +1508,27 @@ export default function P2PFileSharing() {
         setIsDragging(true);
       }
     };
+
     const handleDragLeave = (e) => {
       e.preventDefault();
       if (e.clientX === 0 && e.clientY === 0) {
         setIsDragging(false);
       }
     };
+
     const handleDrop = async (e) => {
       e.preventDefault();
       setIsDragging(false);
+
       if (!peerConnected || !channelsReadyRef.current.file || isZipping) {
         setError("File channel not ready for transfer");
         return;
       }
+
       if (!e.dataTransfer.files?.length) {
         return;
       }
+
       try {
         if (e.dataTransfer.files.length === 1) {
           await sendFile(e.dataTransfer.files[0]);
@@ -1430,9 +1540,11 @@ export default function P2PFileSharing() {
         setError("Failed to process dropped files");
       }
     };
+
     window.addEventListener("dragover", handleDragOver);
     window.addEventListener("dragleave", handleDragLeave);
     window.addEventListener("drop", handleDrop);
+
     return () => {
       window.removeEventListener("dragover", handleDragOver);
       window.removeEventListener("dragleave", handleDragLeave);
@@ -1443,13 +1555,15 @@ export default function P2PFileSharing() {
   const joinRoom = useCallback(() => {
     if (!roomName.trim() || !serverOnline) return;
     const socket = socketRef.current;
-    if (!socket || !socket.connected) socket.connect();
+    if (!socket) return;
+    if (!socket.connected) socket.connect();
     socket.emit("join-room", { roomId: roomName, userId: socket.id });
     setError("Joining room...");
   }, [roomName, serverOnline]);
 
   const sendMessage = useCallback(() => {
     if (!messageInput.trim() || !channelsReadyRef.current.chat) return;
+
     dataChannelRef.current.send(
       JSON.stringify({ type: "message", text: messageInput }),
     );
@@ -1529,7 +1643,7 @@ export default function P2PFileSharing() {
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-md"
           >
-            <div className="flex flex-col items-center gap-4 p-12 border-2 border-dashed border-cyan-400 rounded-3xl liquid-glass shining-effect">
+            <div className="flex flex-col gap-4 p-12 border-2 border-dashed border-cyan-400 rounded-3xl liquid-glass shining-effect">
               <Upload className="w-16 h-16 text-cyan-400" />
               <p className="text-xl font-bold">Drop File or Folder to Send</p>
             </div>
@@ -1572,20 +1686,20 @@ export default function P2PFileSharing() {
               </div>
               <div>
                 <h1 className="text-2xl sm:text-3xl font-bold bg-gradient-to-r from-blue-400 to-cyan-300 bg-clip-text text-transparent">
-                  plink
+                  Plink
                 </h1>
                 <p className="text-xs sm:text-sm text-slate-400 mt-1">
-                  Secure and Fast P2P File Transfer
+                  Secure P2P File Transfer
                 </p>
               </div>
             </div>
             <div className="flex items-center gap-2 sm:gap-4">
-              {/* <button
+              <button
                 onClick={() => setShowSettings(true)}
                 className="flex items-center gap-2 px-3 py-2 rounded-xl liquid-glass shining-effect transition-all"
               >
                 <Settings className="w-5 h-5" />
-              </button>*/}
+              </button>
               <button
                 onClick={checkServerStatus}
                 className={`flex items-center gap-2 px-3 py-2 rounded-xl liquid-glass transition-all ${serverOnline ? "text-emerald-400" : "text-red-400"}`}
@@ -1848,11 +1962,6 @@ export default function P2PFileSharing() {
                         </div>
                         <p className="text-sm text-slate-300 truncate mb-4 font-mono text-center">
                           {transferStats.fileName}
-                          {transferStats.compressed && (
-                            <span className="text-xs text-amber-400 ml-2">
-                              (compressed)
-                            </span>
-                          )}
                         </p>
 
                         <div className="flex justify-center mb-4">
@@ -1943,7 +2052,7 @@ export default function P2PFileSharing() {
                                   dataKey="time"
                                   stroke="rgba(255,255,255,0.4)"
                                   fontSize={10}
-                                  domain={["dataMin", "dataMax"]}
+                                  domain={[0, maxTimeRef.current]}
                                   tickFormatter={(value) => `${value}s`}
                                 />
                                 <YAxis
