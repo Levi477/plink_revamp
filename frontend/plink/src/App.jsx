@@ -28,7 +28,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import pako from "pako";
 
 // --- CONFIG ---
-const DEFAULT_CHUNK_SIZE = 256 * 1024;
+const DEFAULT_CHUNK_SIZE = 64 * 1024;
 const SERVER_URL = "https://plink-revamp-backend.onrender.com";
 
 // --- IndexedDB functions (unchanged) ---
