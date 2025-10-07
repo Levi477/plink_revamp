@@ -1,4 +1,3 @@
-// src/components/shared/SettingsModal.jsx
 import React, { useState } from "react";
 import { motion } from "framer-motion";
 import { DEFAULT_CHUNK_SIZE } from "../../utils/constants";

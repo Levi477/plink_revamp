@@ -1,5 +1,3 @@
-// src/utils/logger.js
-
 /**
  * A handy logger with timestamps. Helps keep track of events in the console.
  * @param {string} message - The message to log.

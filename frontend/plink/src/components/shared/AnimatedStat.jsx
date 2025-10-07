@@ -1,4 +1,3 @@
-// src/components/shared/AnimatedStat.jsx
 import React from "react";
 import { motion } from "framer-motion";
 

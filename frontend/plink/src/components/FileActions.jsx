@@ -1,4 +1,3 @@
-// src/components/FileActions.jsx
 import React from "react";
 import { Upload, Folder } from "lucide-react";
 

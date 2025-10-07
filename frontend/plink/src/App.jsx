@@ -1,9 +1,7 @@
-// src/App.jsx
 import React, { useState, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Upload, Loader2 } from "lucide-react";
 
-// Import all the modular pieces
 import Starfield from "./components/shared/Starfield";
 import SettingsModal from "./components/shared/SettingsModal";
 import Header from "./components/Header";
@@ -18,7 +16,6 @@ import { processAndZipFolder } from "./services/fileHandler";
 import { DEFAULT_CHUNK_SIZE } from "./utils/constants";
 import { log } from "./utils/logger";
 
-// Make sure to import the CSS file
 import "./index.css";
 
 export default function App() {

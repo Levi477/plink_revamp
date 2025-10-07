@@ -1,4 +1,3 @@
-// src/components/Header.jsx
 import React from "react";
 import { Users, Wifi, WifiOff, LogOut } from "lucide-react";
 

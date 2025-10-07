@@ -1,4 +1,3 @@
-// src/hooks/usePeerConnection.js
 import { useState, useEffect, useRef, useCallback } from "react";
 import { io } from "socket.io-client";
 import pako from "pako";

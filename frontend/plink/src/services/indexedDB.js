@@ -1,5 +1,3 @@
-// src/services/indexedDB.js
-
 const DB_NAME = "plink-file-transfer-db";
 const DB_VERSION = 1;
 

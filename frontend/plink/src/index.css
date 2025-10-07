@@ -1,7 +1,6 @@
 @import "tailwindcss";
 
 body {
-    /* This ensures the base font styles are applied */
     font-family: sans-serif;
     background-color: black;
     color: #e2e8f0; /* slate-200 */

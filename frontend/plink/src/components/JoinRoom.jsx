@@ -1,4 +1,3 @@
-// src/components/JoinRoom.jsx
 import React from "react";
 import { motion } from "framer-motion";
 import { Activity, Zap, AlertCircle } from "lucide-react";

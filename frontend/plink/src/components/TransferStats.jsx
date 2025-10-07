@@ -1,4 +1,3 @@
-// src/components/TransferStats.jsx
 import React from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Upload, Download } from "lucide-react";

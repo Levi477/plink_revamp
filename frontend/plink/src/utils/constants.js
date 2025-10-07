@@ -1,5 +1,3 @@
-// src/utils/constants.js
-
 // --- CONFIGURATION ---
 // The default size for each chunk of data sent over the data channel
 export const DEFAULT_CHUNK_SIZE = 256 * 1024;

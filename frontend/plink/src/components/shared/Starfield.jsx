@@ -1,4 +1,3 @@
-// src/components/shared/Starfield.jsx
 import React, { useRef, useEffect } from "react";
 
 // This is a purely decorative component, so it has no props.

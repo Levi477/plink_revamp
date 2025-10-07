@@ -1,4 +1,3 @@
-// src/services/fileHandler.js
 import { log } from "../utils/logger";
 
 /**
