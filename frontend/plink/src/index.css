@@ -1,1 +1,68 @@
 @import "tailwindcss";
+
+body {
+    /* This ensures the base font styles are applied */
+    font-family: sans-serif;
+    background-color: black;
+    color: #e2e8f0; /* slate-200 */
+}
+
+.liquid-glass {
+    background: rgba(15, 23, 42, 0.4);
+    backdrop-filter: blur(20px);
+    border: 2px solid rgba(255, 255, 255, 0.15);
+    box-shadow:
+        4px 4px 0px rgba(0, 0, 0, 0.3),
+        8px 8px 0px rgba(0, 0, 0, 0.2);
+    transition: all 0.2s ease;
+}
+
+.liquid-glass:hover {
+    border-color: rgba(255, 255, 255, 0.25);
+    box-shadow:
+        4px 4px 0px rgba(59, 130, 246, 0.3),
+        8px 8px 0px rgba(0, 0, 0, 0.2);
+    transform: translate(-1px, -1px);
+}
+
+.shining-effect {
+    position: relative;
+    overflow: hidden;
+}
+
+.shining-effect::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(
+        90deg,
+        transparent,
+        rgba(255, 255, 255, 0.1),
+        transparent
+    );
+    transition: left 0.5s ease;
+}
+
+.shining-effect:hover::before {
+    left: 100%;
+}
+
+.flat-button {
+    border: 2px solid rgba(255, 255, 255, 0.2);
+    box-shadow: 2px 2px 0px rgba(0, 0, 0, 0.3);
+    transition: all 0.2s ease;
+}
+
+.flat-button:hover {
+    border-color: rgba(255, 255, 255, 0.3);
+    box-shadow: 3px 3px 0px rgba(0, 0, 0, 0.3);
+    transform: translate(-1px, -1px);
+}
+
+.recharts-tooltip-cursor {
+    stroke: rgba(59, 130, 246, 0.5);
+    stroke-width: 1;
+}
