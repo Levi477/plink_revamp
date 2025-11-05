@@ -20,7 +20,6 @@ import "./index.css";
 
 export default function App() {
   // --- UI State Management ---
-  // This state is managed here because it's purely for the UI and doesn't affect the connection logic.
   const [isDragging, setIsDragging] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [isZipping, setIsZipping] = useState(false);
@@ -29,8 +28,12 @@ export default function App() {
     compression: true,
   });
 
+  // --- New state for password ---
+  const [password, setPassword] = useState("");
+
   // --- Core Logic Hook ---
   // All the complex WebRTC/Socket logic is handled by this custom hook.
+  // We get the 'joinRoom' function from it.
   const {
     roomName,
     setRoomName,
@@ -43,7 +46,7 @@ export default function App() {
     speedData,
     connectionState,
     channelsReady,
-    joinRoom,
+    joinRoom, // This function now expects the password
     leaveRoom,
     sendMessage,
     sendFile,
@@ -52,6 +55,18 @@ export default function App() {
 
   // --- Event Handlers ---
 
+  /**
+   * Wrapper for the `leaveRoom` hook.
+   * We add logic to also clear the password when leaving.
+   */
+  const handleLeaveRoom = () => {
+    leaveRoom();
+    setPassword(""); // Clear password on leave
+  };
+
+  /**
+   * Handles zipping a folder before sending.
+   */
   const handleSendFolder = useCallback(
     async (files) => {
       setIsZipping(true);
@@ -158,19 +173,24 @@ export default function App() {
         <Header
           serverOnline={serverOnline}
           isConnected={isConnected}
-          leaveRoom={leaveRoom}
+          leaveRoom={handleLeaveRoom} // Use the new wrapper function
           roomName={roomName}
         />
         <main>
           {!isConnected ? (
+            // --- Join Room View ---
+            // Pass down password state and the wrapped joinRoom function
             <JoinRoom
               roomName={roomName}
               setRoomName={setRoomName}
-              joinRoom={joinRoom}
+              password={password}
+              setPassword={setPassword}
+              joinRoom={() => joinRoom(password)} // Pass the password to the hook's function
               error={error}
               serverOnline={serverOnline}
             />
           ) : (
+            // --- Connected View ---
             <>
               <StatusDisplay
                 isConnected={isConnected}
